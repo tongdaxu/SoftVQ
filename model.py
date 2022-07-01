@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, RelaxedOneHotCategorical
 import math
-
+import numpy as np
 
 class VQEmbeddingEMA(nn.Module):
     def __init__(self, latent_dim, num_embeddings, embedding_dim, commitment_cost=0.25, decay=0.999, epsilon=1e-5):
@@ -57,11 +57,99 @@ class VQEmbeddingEMA(nn.Module):
 
         return quantized.permute(1, 0, 4, 2, 3).reshape(B, C, H, W), loss, perplexity.sum()
 
+class MultiCodebookSoftVQ(nn.Module):
+    def __init__(self,m,k,d,hard=True,rand_cb="False",scale_mode="per_cluster",
+                 eps=1e-5,prior_mode="uniform"):
+        """
+        m: codebook number
+        rand_cb=False, scale_mode="hard" is equvailent to VQVAE
+        rand_cb=False, scale_mode="per_cluster" is soft cluster VQVAE
+        rand_cb=True, scale_mode="per_cluster"/"per_dimension" is stochastic cb VQVAE
+        """
+        super().__init__()
+        self.m=m
+        self.k=k
+        self.d=d  # dim per codeword
+        self.c=self.m*self.d
+        self.st_gumbel=hard
+        if rand_cb=="False":
+            self.rand_cb=False
+        elif rand_cb=="True":
+            self.rand_cb=True
+        else:
+            raise NotImplementedError
+        self.scale_mode=scale_mode
+        self.prior_mode=prior_mode
+        self.eps=eps
+        self.mus=nn.Parameter(torch.Tensor(self.m,self.k,self.d))
+        self.rcn=8
+        nn.init.uniform_(self.mus,-1/self.k,1/self.k)
+        if self.scale_mode=="per_cluster":
+            self.scales=nn.Parameter(torch.ones([self.m, self.k, 1], requires_grad=True)/math.sqrt(2))
+        elif self.scale_mode=="hard":
+            self.scales=nn.Parameter(torch.ones([1,1,1],requires_grad=False)/math.sqrt(2))
+            self.scales.requires_grad=False
+        elif self.scale_mode=="uniform":
+            self.scales=nn.Parameter(torch.ones([1,1,1],requires_grad=True)/math.sqrt(2))
+        elif self.scale_mode=="per_dimension":
+            self.scales=nn.Parameter(torch.ones([self.m,self.k,self.d],requires_grad=True)/math.sqrt(2))
+        else:
+            raise NotImplementedError
+        if self.prior_mode=="uniform":
+            self.log_py_raw=nn.Parameter(torch.ones([self.m,self.k],requires_grad=False))
+            self.log_py_raw.requires_grad=False
+        elif self.prior_mode=="categorical":
+            self.log_py_raw=nn.Parameter(torch.ones([self.m,self.k],requires_grad=True))
+        else:
+            raise NotImplementedError
+
+    def forward(self, input, tau=0.5):
+        # input: B,C,H,W
+        b, c, h, w = input.shape
+        assert(c == self.c)
+        m = self.m
+        k = self.k
+        d = self.d
+        input=input.permute(0,2,3,1).reshape(b * h * w, m, d)  # bhw m d
+        dist=torch.distributions.normal.Normal(self.mus, torch.clamp(self.scales,min=self.eps))  # m k d
+        log_probs_raw = torch.sum(dist.log_prob(input[..., None, :]), dim=-1)  # bhw m k
+        log_probs_raw += self.log_py_raw
+        probs = F.softmax(log_probs_raw, dim=-1)  # bhw m k
+        log_probs=F.log_softmax(log_probs_raw, dim=-1) # bhw m k
+        if self.training:
+            onehot=F.gumbel_softmax(log_probs_raw,tau=tau,hard=self.st_gumbel,eps=self.eps,dim=-1)
+        else:
+            # MLE
+            onehot=torch.argmax(probs,dim=-1,keepdim=True)
+            onehot=torch.zeros_like(probs).scatter_(-1,onehot,1)
+        if self.rand_cb and self.training:
+            onehot=onehot.reshape(b,h,w,m,k)
+            onehot=torch.repeat_interleave(onehot,repeats=self.rcn,dim=0).reshape(b,self.rcn,h,w,m,k)
+            reparam_mu=torch.repeat_interleave(torch.zeros_like(self.mus),repeats=self.rcn,dim=0).reshape(self.rcn,m,k,d)
+            reparam_sigma=torch.ones_like(reparam_mu)
+            dist_eps = torch.distributions.normal.Normal(reparam_mu,reparam_sigma)
+            reparam_sample = dist_eps.sample() * self.scales[None] + self.mus[None]
+            # bmk, mkd -> bmd 
+            # bnmk, nmkd -> bnmd 
+            sample = torch.einsum('bnhwmk, nmkd -> bnhwmd', onehot, reparam_sample)
+            sample = sample.reshape(b*self.rcn, h, w, m*d).permute(0, 3, 1, 2)
+        else:
+            sample = torch.einsum('bmk, mkd -> bmd', onehot, self.mus)
+            sample = sample.reshape(b, h, w, m*d).permute(0, 3, 1, 2)
+        # klde = probs*(log_probs+np.log(self.k))
+        klde = probs*(log_probs-(self.log_py_raw-torch.logsumexp(self.log_py_raw,dim=-1,keepdim=True))[None])
+        klde[(probs == 0).expand_as(klde)] = 0 # force 0 log 0 = 0
+        klde = klde.reshape(b,-1)
+        kldesum = klde.sum(-1).mean()
+        return sample, kldesum, torch.zeros_like(kldesum)
+
 
 class VQEmbeddingGSSoft(nn.Module):
     def __init__(self, latent_dim, num_embeddings, embedding_dim):
         super(VQEmbeddingGSSoft, self).__init__()
-
+        # latent_dim: code book number
+        # num_embeddings: categorical size
+        # embedding dim: latent dim
         self.embedding = nn.Parameter(torch.Tensor(latent_dim, num_embeddings, embedding_dim))
         nn.init.uniform_(self.embedding, -1/num_embeddings, 1/num_embeddings)
 
@@ -174,10 +262,13 @@ class VQVAE(nn.Module):
 
 
 class GSSOFT(nn.Module):
-    def __init__(self, channels, latent_dim, num_embeddings, embedding_dim):
+    def __init__(self, channels, latent_dim, num_embeddings, embedding_dim, sigma_tag, rand_cb, prior_mode):
         super(GSSOFT, self).__init__()
         self.encoder = Encoder(channels, latent_dim, embedding_dim)
-        self.codebook = VQEmbeddingGSSoft(latent_dim, num_embeddings, embedding_dim)
+        if sigma_tag=="default":
+            self.codebook = VQEmbeddingGSSoft(latent_dim, num_embeddings, embedding_dim)
+        else:
+            self.codebook = MultiCodebookSoftVQ(latent_dim,num_embeddings,embedding_dim,hard=False,rand_cb=rand_cb,scale_mode=sigma_tag,prior_mode=prior_mode)
         self.decoder = Decoder(channels, latent_dim, embedding_dim)
 
     def forward(self, x):
@@ -185,3 +276,26 @@ class GSSOFT(nn.Module):
         x, KL, perplexity = self.codebook(x)
         dist = self.decoder(x)
         return dist, KL, perplexity
+
+'''
+class GSSOFTHyper(nn.Module):
+    def __init__(self, channels, latent_dim, num_embeddings, embedding_dim, sigma_tag, rand_cb, prior_mode):
+        super(GSSOFTHyper, self).__init__()
+        # 32x32x3 -> 
+        self.encoder1 = Encoder(channels, latent_dim, embedding_dim)
+        self.encoder2 = Encoder(latent_dim * embedding_dim, latent_dim, embedding_dim)
+        if sigma_tag=="default":
+            self.codebook1 = VQEmbeddingGSSoft(latent_dim, num_embeddings, embedding_dim)
+            self.codebook2 = VQEmbeddingGSSoft(latent_dim, num_embeddings, embedding_dim)
+        else:
+            self.codebook1 = MultiCodebookSoftVQ(latent_dim,num_embeddings,embedding_dim,hard=False,rand_cb=rand_cb,scale_mode=sigma_tag,prior_mode=prior_mode)
+            self.codebook2 = MultiCodebookSoftVQ(latent_dim,num_embeddings,embedding_dim,hard=False,rand_cb=rand_cb,scale_mode=sigma_tag,prior_mode=prior_mode)
+        self.decoder2 = Decoder(latent_dim * embedding_dim, latent_dim, embedding_dim)
+        self.decoder1 = Decoder(channels, latent_dim, embedding_dim)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x, KL, perplexity = self.codebook(x)
+        dist = self.decoder(x)
+        return dist, KL, perplexity
+'''
