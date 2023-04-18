@@ -205,7 +205,7 @@ class Residual(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, channels, latent_dim, embedding_dim):
+    def __init__(self, channels, latent_dim, embedding_dim=1):
         super(Encoder, self).__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(3, channels, 4, 2, 1, bias=False),
@@ -223,7 +223,7 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, channels, latent_dim, embedding_dim):
+    def __init__(self, channels, latent_dim, embedding_dim=1):
         super(Decoder, self).__init__()
         self.decoder = nn.Sequential(
             nn.Conv2d(latent_dim * embedding_dim, channels, 1, bias=False),
@@ -246,6 +246,13 @@ class Decoder(nn.Module):
         dist = Categorical(logits=x)
         return dist
 
+class VAE(nn.Module):
+    def __init__(self, channels, latent_dim) -> None:
+        super(VAE, self).__init__()
+        self.encoder = Encoder(channels, latent_dim)
+        self.decoder = Decoder(channels, latent_dim)
+
+    def forward(self, x):
 
 class VQVAE(nn.Module):
     def __init__(self, channels, latent_dim, num_embeddings, embedding_dim):
@@ -277,7 +284,7 @@ class GSSOFT(nn.Module):
         dist = self.decoder(x)
         return dist, KL, perplexity
 
-'''
+
 class GSSOFTHyper(nn.Module):
     def __init__(self, channels, latent_dim, num_embeddings, embedding_dim, sigma_tag, rand_cb, prior_mode):
         super(GSSOFTHyper, self).__init__()
@@ -298,4 +305,3 @@ class GSSOFTHyper(nn.Module):
         x, KL, perplexity = self.codebook(x)
         dist = self.decoder(x)
         return dist, KL, perplexity
-'''
